@@ -1815,43 +1815,53 @@ class RescheduleAgent:
             requirement, date_str, slot_index,
         )
 
-        # 构建 messages（OpenAI Responses API 用 input 列表）
-        messages = [
+        # 第一次调用：传完整 input
+        initial_input = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": "请开始排课分析。先检查意向时间的冲突情况，然后按策略优先级逐步尝试。"},
         ]
 
+        prev_response_id = None
+
         for step in range(max_steps):
             print(f"  [Agent 第 {step+1} 步]")
 
-            resp = self.client.responses.create(
-                model=self.model,
-                input=messages,
-                tools=AGENT_TOOLS,
-            )
+            if prev_response_id is None:
+                # 首次调用
+                resp = self.client.responses.create(
+                    model=self.model,
+                    input=initial_input,
+                    tools=AGENT_TOOLS,
+                )
+            else:
+                # 后续调用：用 previous_response_id 链式传递上下文
+                # input 只需要传工具返回结果
+                resp = self.client.responses.create(
+                    model=self.model,
+                    input=tool_outputs,
+                    previous_response_id=prev_response_id,
+                    tools=AGENT_TOOLS,
+                )
 
-            # 处理 response — 直接把 resp.output 追加到 messages
-            # Responses API 要求把上一轮的完整 output 原样传回
+            prev_response_id = resp.id
+
+            # 处理 response
             tool_calls_to_process = []
 
             for item in resp.output:
                 if hasattr(item, "type"):
                     if item.type == "function_call":
                         tool_calls_to_process.append(item)
-                    elif item.type == "message" or hasattr(item, "content"):
-                        if hasattr(item, "content"):
-                            for c in item.content:
-                                if hasattr(c, "text"):
-                                    print(f"    Agent: {c.text[:200]}...")
-
-            # 把模型的完整 output 原样追加（Responses API 格式）
-            messages.append(resp)
+                    elif hasattr(item, "content"):
+                        for c in item.content:
+                            if hasattr(c, "text"):
+                                print(f"    Agent: {c.text[:200]}...")
 
             if not tool_calls_to_process:
-                # 没有工具调用，可能是纯文本回复或结束
                 break
 
-            # 执行所有工具调用
+            # 执行所有工具调用，收集结果
+            tool_outputs = []
             finished = False
             for tc in tool_calls_to_process:
                 func_name = tc.name
@@ -1863,9 +1873,8 @@ class RescheduleAgent:
                 print(f"    -> 调用 {func_name}({json.dumps(func_args, ensure_ascii=False)[:100]})")
                 tool_result = self._execute_tool(func_name, func_args)
 
-                # Responses API: function_call_output 格式
                 result_str = json.dumps(tool_result, ensure_ascii=False, default=str)
-                messages.append({
+                tool_outputs.append({
                     "type": "function_call_output",
                     "call_id": tc.call_id,
                     "output": result_str,
@@ -1882,22 +1891,22 @@ class RescheduleAgent:
                 }
 
         # 超过 max_steps 还没 finish，强制总结
-        summary = self._force_summary(messages)
+        summary = self._force_summary(prev_response_id)
         return {
             "proposals": self.proposals,
             "summary": summary,
             "steps_used": max_steps,
         }
 
-    def _force_summary(self, messages: List) -> str:
+    def _force_summary(self, prev_response_id: str) -> str:
         """超步数后强制让 LLM 给出最终总结。"""
-        messages.append({
-            "role": "user",
-            "content": "你已经用完了所有步数。请立即调用 finish 工具，给出最终总结，包括你已经找到的所有方案和推荐。",
-        })
         resp = self.client.responses.create(
             model=self.model,
-            input=messages,
+            input=[{
+                "role": "user",
+                "content": "你已经用完了所有步数。请立即调用 finish 工具，给出最终总结，包括你已经找到的所有方案和推荐。",
+            }],
+            previous_response_id=prev_response_id,
             tools=AGENT_TOOLS,
         )
         for item in resp.output:
