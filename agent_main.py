@@ -1830,33 +1830,22 @@ class RescheduleAgent:
                 tools=AGENT_TOOLS,
             )
 
-            # 处理 response
-            assistant_msg = {"role": "assistant", "content": []}
+            # 处理 response — 直接把 resp.output 追加到 messages
+            # Responses API 要求把上一轮的完整 output 原样传回
             tool_calls_to_process = []
 
             for item in resp.output:
                 if hasattr(item, "type"):
                     if item.type == "function_call":
                         tool_calls_to_process.append(item)
-                        assistant_msg["content"].append({
-                            "type": "function_call",
-                            "id": item.id,
-                            "call_id": item.call_id,
-                            "name": item.name,
-                            "arguments": item.arguments,
-                        })
                     elif item.type == "message" or hasattr(item, "content"):
-                        # 文本回复
                         if hasattr(item, "content"):
                             for c in item.content:
                                 if hasattr(c, "text"):
-                                    assistant_msg["content"].append({
-                                        "type": "text",
-                                        "text": c.text,
-                                    })
                                     print(f"    Agent: {c.text[:200]}...")
 
-            messages.append(assistant_msg)
+            # 把模型的完整 output 原样追加（Responses API 格式）
+            messages.append(resp)
 
             if not tool_calls_to_process:
                 # 没有工具调用，可能是纯文本回复或结束
@@ -1874,12 +1863,12 @@ class RescheduleAgent:
                 print(f"    -> 调用 {func_name}({json.dumps(func_args, ensure_ascii=False)[:100]})")
                 tool_result = self._execute_tool(func_name, func_args)
 
-                # 序列化工具结果
+                # Responses API: function_call_output 格式
                 result_str = json.dumps(tool_result, ensure_ascii=False, default=str)
                 messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.call_id,
-                    "content": result_str,
+                    "type": "function_call_output",
+                    "call_id": tc.call_id,
+                    "output": result_str,
                 })
 
                 if func_name == "finish":
