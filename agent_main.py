@@ -1,25 +1,57 @@
 import os
+import sys
 import json
 from datetime import datetime, timedelta, time
 from typing import Dict, Any, List, Tuple
 
+# 数据时间戳基于 CST (Asia/Shanghai, UTC+8)，确保本地时区一致
+os.environ.setdefault("TZ", "Asia/Shanghai")
+try:
+    import time as _time_mod
+    _time_mod.tzset()
+except AttributeError:
+    pass  # Windows 没有 tzset
+
 import pandas as pd
-from sqlalchemy import create_engine, text
 from openai import OpenAI
 
 # =========================
-# 1. 数据库连接 & 工具函数
+# 1. 数据源选择: CSV 或 MySQL
 # =========================
+# 优先级:
+#   1. 命令行参数 --csv <目录>
+#   2. 环境变量 DATA_MODE=csv  +  CSV_DIR=./env_huayao_tables
+#   3. 默认使用 MySQL
 
-USER    = "root"
-PASS    = "fighting"           # TODO: 填你的密码
-DB      = "env_huayao"
-SOCKET  = "/tmp/mysql.sock"
+DATA_MODE = os.environ.get("DATA_MODE", "mysql").lower()
+CSV_DIR   = os.environ.get("CSV_DIR", "./env_huayao_tables")
 
-engine = create_engine(
-    f"mysql+pymysql://{USER}:{PASS}@localhost/{DB}?unix_socket={SOCKET}",
-    pool_pre_ping=True
-)
+# 检查命令行参数
+if "--csv" in sys.argv:
+    DATA_MODE = "csv"
+    idx = sys.argv.index("--csv")
+    if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("--"):
+        CSV_DIR = sys.argv[idx + 1]
+
+if DATA_MODE == "csv":
+    from csv_engine import CsvEngine
+    engine = CsvEngine(CSV_DIR)
+
+    # 提供一个兼容的 text() 函数，CSV 模式下 SQL 字符串直接透传
+    def text(s):
+        return s
+else:
+    from sqlalchemy import create_engine, text
+
+    USER    = "root"
+    PASS    = os.environ.get("MYSQL_PASS", "fighting")
+    DB      = "env_huayao"
+    SOCKET  = "/tmp/mysql.sock"
+
+    engine = create_engine(
+        f"mysql+pymysql://{USER}:{PASS}@localhost/{DB}?unix_socket={SOCKET}",
+        pool_pre_ping=True
+    )
 
 
 LESSON_MINUTES = 90  # 一节课 1.5 小时

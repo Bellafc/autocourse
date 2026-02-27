@@ -12,13 +12,29 @@
   8. 边界时间段（早/晚）
 
 使用方式：
-  python test_cases.py              # 列出所有测试用例
-  python test_cases.py --run N      # 自动运行第 N 个用例
-  python test_cases.py --run all    # 依次运行所有用例（需要 OpenAI key）
+  python test_cases.py                          # 列出所有测试用例
+  python test_cases.py --dry 1                  # 用 CSV 仅查课表(不调Agent)
+  python test_cases.py --dry all                # 全部仅查课表
+  python test_cases.py --run N                  # 运行第 N 个用例(需要 OpenAI key)
+  python test_cases.py --run all                # 运行所有用例
+  python test_cases.py --csv ./env_huayao_tables  # 指定 CSV 目录(默认)
+  python test_cases.py --mysql                  # 使用 MySQL 数据库
 """
 
 import sys
 import os
+
+# 默认使用 CSV 模式（不需要 MySQL）
+# 可通过 --mysql 切换到 MySQL 模式
+if "--mysql" not in sys.argv:
+    os.environ.setdefault("DATA_MODE", "csv")
+    # 检查 --csv 参数指定目录
+    if "--csv" in sys.argv:
+        idx = sys.argv.index("--csv")
+        if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith("--"):
+            os.environ["CSV_DIR"] = sys.argv[idx + 1]
+    else:
+        os.environ.setdefault("CSV_DIR", "./env_huayao_tables")
 
 # ──────────────────────────────────────────────
 # 测试用例定义
@@ -449,14 +465,28 @@ def run_case(tc, dry_run=False):
 
 
 def main():
-    if len(sys.argv) < 2:
+    # 过滤掉 --csv / --mysql 参数，只保留操作参数
+    action_args = []
+    i = 1
+    while i < len(sys.argv):
+        if sys.argv[i] == "--csv":
+            i += 1  # 跳过 --csv
+            if i < len(sys.argv) and not sys.argv[i].startswith("--"):
+                i += 1  # 跳过 csv 目录参数
+        elif sys.argv[i] == "--mysql":
+            i += 1
+        else:
+            action_args.append(sys.argv[i])
+            i += 1
+
+    if not action_args:
         print_all_cases()
         return
 
-    mode = sys.argv[1]
+    mode = action_args[0]
 
-    if mode == "--run" and len(sys.argv) >= 3:
-        target = sys.argv[2]
+    if mode == "--run" and len(action_args) >= 2:
+        target = action_args[1]
         if target == "all":
             for tc in TEST_CASES:
                 run_case(tc)
@@ -468,8 +498,8 @@ def main():
                 return
             run_case(tc)
 
-    elif mode == "--dry" and len(sys.argv) >= 3:
-        target = sys.argv[2]
+    elif mode == "--dry" and len(action_args) >= 2:
+        target = action_args[1]
         if target == "all":
             for tc in TEST_CASES:
                 run_case(tc, dry_run=True)
@@ -483,11 +513,13 @@ def main():
 
     else:
         print("用法:")
-        print("  python test_cases.py              # 列出所有用例")
-        print("  python test_cases.py --run N       # 运行第N个用例")
-        print("  python test_cases.py --run all     # 运行所有用例")
-        print("  python test_cases.py --dry N       # 仅查课表不调Agent")
-        print("  python test_cases.py --dry all     # 全部仅查课表")
+        print("  python test_cases.py                            # 列出所有用例")
+        print("  python test_cases.py --dry N                    # 仅查课表(CSV模式)")
+        print("  python test_cases.py --dry all                  # 全部仅查课表")
+        print("  python test_cases.py --run N                    # 运行第N个用例(需OpenAI key)")
+        print("  python test_cases.py --run all                  # 运行所有用例")
+        print("  python test_cases.py --csv ./my_csv_dir --dry 1 # 指定CSV目录")
+        print("  python test_cases.py --mysql --dry 1            # 使用MySQL")
 
 
 if __name__ == "__main__":
