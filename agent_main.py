@@ -310,6 +310,157 @@ def check_schedule(
         "end_time": end_time_str,
     }
 
+
+# =========================================================
+# query_lesson_schedule: 核心查询 — 给定时间+老师+学生，查课
+# =========================================================
+
+def query_lesson_schedule(
+    engine,
+    date_str: str,
+    slot_index: int,
+    teacher_id: int,
+    student_id: int,
+) -> Dict[str, Any]:
+    """
+    输入: 日期 (YYYY-MM-DD), timeslot 索引 (0-5 对应 ALLOWED_SLOTS), teacher_id, student_id
+    输出:
+    {
+        "slot_start": "2025-11-13 09:00:00",
+        "slot_end":   "2025-11-13 10:30:00",
+        "student_has_class": True/False,
+        "student_lessons": [ {lesson_id, class_name, topic, teacher_id, teacher_name, ...} ],
+        "teacher_has_class": True/False,
+        "teacher_lessons": [ {lesson_id, class_name, topic, class_id, students_in_class: [...], ...} ],
+    }
+
+    流程:
+    1. lessons.start_time/end_time 匹配时间 → 取 subject_id
+    2. subject_id → subjects.class_id, subjects.teacher_id
+    3. class_id → classes.class_type (课名)
+    4. class_id → student_classes 里筛选 student_id (enrollment 时间要 cover 查询时间)
+    """
+    if slot_index < 0 or slot_index >= len(ALLOWED_SLOTS):
+        return {"error": f"slot_index 必须在 0~{len(ALLOWED_SLOTS)-1} 之间"}
+
+    slot = ALLOWED_SLOTS[slot_index]
+    target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    slot_start_dt, slot_end_dt = build_slot_dt(target_date, slot)
+    start_unix = int(slot_start_dt.timestamp())
+    end_unix = int(slot_end_dt.timestamp())
+
+    result = {
+        "slot_start": slot_start_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "slot_end": slot_end_dt.strftime("%Y-%m-%d %H:%M:%S"),
+        "student_has_class": False,
+        "student_lessons": [],
+        "teacher_has_class": False,
+        "teacher_lessons": [],
+    }
+
+    with engine.connect() as conn:
+        # ---- 学生在该时间段的课 ----
+        student_sql = text("""
+            SELECT
+                l.id            AS lesson_id,
+                l.start_time    AS lesson_start_unix,
+                l.end_time      AS lesson_end_unix,
+                s.id            AS subject_id,
+                s.class_id      AS class_id,
+                s.teacher_id    AS teacher_id,
+                c.class_type    AS class_name,
+                t.name          AS topic_name,
+                t.cn_name       AS topic_cn_name,
+                stf.name_search_cache AS teacher_name
+            FROM lessons l
+            JOIN subjects s ON l.subject_id = s.id
+            JOIN classes c ON s.class_id = c.id
+            JOIN student_classes sc ON sc.class_id = s.class_id
+            LEFT JOIN topics t ON s.topic_id = t.id
+            LEFT JOIN staff stf ON s.teacher_id = stf.id
+            WHERE ((l.start_time = -1 OR l.start_time <= :end_unix)
+               AND (l.end_time = -1 OR l.end_time >= :start_unix))
+              AND ((sc.start_time = -1 OR sc.start_time <= :end_unix)
+               AND (sc.end_time = -1 OR sc.end_time >= :start_unix))
+              AND sc.student_id = :student_id
+            ORDER BY l.start_time
+        """)
+        student_rows = conn.execute(
+            student_sql,
+            {"start_unix": start_unix, "end_unix": end_unix, "student_id": student_id},
+        ).mappings().all()
+
+        seen_lessons = set()
+        for r in student_rows:
+            row = dict(r)
+            lid = row["lesson_id"]
+            if lid in seen_lessons:
+                continue
+            seen_lessons.add(lid)
+            row["topic"] = (row.get("topic_name") or "") + (row.get("topic_cn_name") or "")
+            result["student_lessons"].append(row)
+
+        result["student_has_class"] = len(result["student_lessons"]) > 0
+
+        # ---- 老师在该时间段的课 ----
+        teacher_sql = text("""
+            SELECT
+                l.id            AS lesson_id,
+                l.start_time    AS lesson_start_unix,
+                l.end_time      AS lesson_end_unix,
+                s.id            AS subject_id,
+                s.class_id      AS class_id,
+                s.teacher_id    AS teacher_id,
+                c.class_type    AS class_name,
+                t.name          AS topic_name,
+                t.cn_name       AS topic_cn_name
+            FROM lessons l
+            JOIN subjects s ON l.subject_id = s.id
+            JOIN classes c ON s.class_id = c.id
+            LEFT JOIN topics t ON s.topic_id = t.id
+            WHERE ((l.start_time = -1 OR l.start_time <= :end_unix)
+               AND (l.end_time = -1 OR l.end_time >= :start_unix))
+              AND s.teacher_id = :teacher_id
+            ORDER BY l.start_time
+        """)
+        teacher_rows = conn.execute(
+            teacher_sql,
+            {"start_unix": start_unix, "end_unix": end_unix, "teacher_id": teacher_id},
+        ).mappings().all()
+
+        seen_lessons = set()
+        for r in teacher_rows:
+            row = dict(r)
+            lid = row["lesson_id"]
+            if lid in seen_lessons:
+                continue
+            seen_lessons.add(lid)
+            row["topic"] = (row.get("topic_name") or "") + (row.get("topic_cn_name") or "")
+
+            # 附加：该课涉及哪些学生
+            class_id = row["class_id"]
+            sc_rows = conn.execute(
+                text("""
+                    SELECT sc.student_id, stu.name_search_cache AS student_name
+                    FROM student_classes sc
+                    LEFT JOIN students stu ON sc.student_id = stu.id
+                    WHERE sc.class_id = :cid
+                      AND ((sc.start_time = -1 OR sc.start_time <= :end_unix)
+                       AND (sc.end_time = -1 OR sc.end_time >= :start_unix))
+                """),
+                {"cid": class_id, "start_unix": start_unix, "end_unix": end_unix},
+            ).mappings().all()
+            row["students_in_class"] = [
+                {"student_id": s["student_id"], "student_name": s["student_name"]}
+                for s in sc_rows
+            ]
+            result["teacher_lessons"].append(row)
+
+        result["teacher_has_class"] = len(result["teacher_lessons"]) > 0
+
+    return result
+
+
 def direct_check_and_plan(
     engine,
     student_name: str,
@@ -833,7 +984,7 @@ def clear_slot_for_group(
         if depth >= max_depth:
             return None
 
-        # 4. 第二招：在未来一周枚举一些候选时间段，把这节课挪过去，但需要先“清空”那个时间段
+        # 4. 第二招：在未来一周枚举一些候选时间段，把这节课挪过去，但需要先"清空"那个时间段
         candidate_slots = enumerate_future_slots(from_dt=from_dt, horizon_days=horizon_days)
 
         success_for_this_lesson = False
@@ -876,7 +1027,7 @@ def clear_slot_for_group(
 def extract_conflicting_lessons(check_result: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
     从 check_schedule 的返回中，提取老师在该时间段的所有lesson。
-    这些就是“候选可以被挪走的课”。
+    这些就是"候选可以被挪走的课"。
     """
     return check_result.get("teacher_struct", [])
 
@@ -889,7 +1040,7 @@ def find_future_slots_for_class_discrete_all(
     max_slots: int = 20,
 ) -> List[Tuple[datetime, datetime]]:
     """
-    在 from_dt 之后 horizon_days 的范围内，寻找所有“老师 + 学生都空闲”的 90min slot。
+    在 from_dt 之后 horizon_days 的范围内，寻找所有"老师 + 学生都空闲"的 90min slot。
     - slot 固定为 ALLOWED_SLOTS 中的时间段
     - 只考虑工作日（周一~周五），不排周末
     - 最多返回 max_slots 个候选（以免结果太长）
@@ -931,7 +1082,7 @@ def move_existing_lessons_strategy(
 ) -> Dict[str, Any]:
     """
     方案二：考虑把老师在这段时间的冲突课挪到未来某个共同空档。
-    目标：只需要在 intent_start ~ intent_end 之间空出“一个完整的 90 分钟 slot”，
+    目标：只需要在 intent_start ~ intent_end 之间空出"一个完整的 90 分钟 slot"，
     而不是把所有冲突课全搬走。
 
     这里不再生成 LLM 文本说明，只返回结构化的候选方案：
@@ -970,7 +1121,7 @@ def move_existing_lessons_strategy(
     intent_end_dt = datetime.fromisoformat(intent_end)
     target_date = intent_start_dt.date()  # 假设新课只安排在同一天
 
-    # 3. 枚举目标时间段内的所有“可用 slot”（90min固定节次）
+    # 3. 枚举目标时间段内的所有"可用 slot"（90min固定节次）
     candidate_target_slots: List[Tuple[datetime, datetime]] = []
     for slot in ALLOWED_SLOTS:
         slot_start_dt, slot_end_dt = build_slot_dt(target_date, slot)
@@ -989,7 +1140,7 @@ def move_existing_lessons_strategy(
     all_possible_move_plans: List[Dict[str, Any]] = []
 
     for slot_start_dt, slot_end_dt in candidate_target_slots:
-        # 4.1 找出“与这个 slot 有重叠”的课程（只挪这些）
+        # 4.1 找出"与这个 slot 有重叠"的课程（只挪这些）
         slot_conflicts: List[Dict[str, Any]] = []
         for les in conflicts:
             les_start_str = les.get("lesson_start")
@@ -1032,7 +1183,7 @@ def move_existing_lessons_strategy(
             except Exception:
                 from_dt = slot_start_dt  # 兜底：用目标 slot 起始时间
 
-            # ⭐ 拿到“未来一周内所有可行的 slot”（你之前已经实现了这个函数）
+            # ⭐ 拿到"未来一周内所有可行的 slot"（你之前已经实现了这个函数）
             all_slots = find_future_slots_for_class_discrete_all(
                 engine,
                 teacher_id=teacher_id,
@@ -1137,9 +1288,614 @@ def summarize_student_week(engine, student_name: str, week_start: str, week_end:
         result.append(row)
     return result
 
-# =========================
-# 2. LLM Agent 核心
-# =========================
+# =========================================================
+# 2a. RescheduleAgent 工具函数（给 agent 用的 tool）
+# =========================================================
+
+def tool_check_slot(
+    engine,
+    teacher_id: int,
+    student_id: int,
+    date_str: str,
+    slot_index: int,
+) -> Dict[str, Any]:
+    """
+    工具1: 查询某个 timeslot 内老师和学生的课表。
+    返回结构化的冲突信息。
+    """
+    return query_lesson_schedule(engine, date_str, slot_index, teacher_id, student_id)
+
+
+def tool_find_alt_teachers(
+    engine,
+    topic_ids: List[int],
+    student_id: int,
+    date_str: str,
+    slot_index: int,
+) -> List[Dict[str, Any]]:
+    """
+    工具2: 找到教同一科目的其他老师，并检查他们在指定时间是否有空。
+    返回可用老师列表。
+    """
+    if not topic_ids:
+        return []
+
+    slot = ALLOWED_SLOTS[slot_index]
+    target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    slot_start_dt, slot_end_dt = build_slot_dt(target_date, slot)
+    start_unix = int(slot_start_dt.timestamp())
+    end_unix = int(slot_end_dt.timestamp())
+
+    teacher_ids = fetch_teachers_for_topics(engine, topic_ids)
+    teacher_map = fetch_teacher_names(engine, teacher_ids)
+
+    results = []
+    for tid, tname in teacher_map.items():
+        free = is_group_free(engine, tid, [student_id], start_unix, end_unix)
+        results.append({
+            "teacher_id": tid,
+            "teacher_name": tname,
+            "is_free": free,
+            "slot": f"{slot_start_dt.strftime('%Y-%m-%d %H:%M')} ~ {slot_end_dt.strftime('%H:%M')}",
+        })
+
+    return results
+
+
+def tool_find_alt_times_for_teacher(
+    engine,
+    teacher_id: int,
+    student_id: int,
+    from_date_str: str,
+    horizon_days: int = 14,
+    max_slots: int = 20,
+) -> List[Dict[str, str]]:
+    """
+    工具3: 同一个老师，找未来 horizon_days 内所有老师+学生都空闲的时间段。
+    """
+    from_dt = datetime.strptime(from_date_str, "%Y-%m-%d")
+    slots = find_future_slots_for_class_discrete_all(
+        engine,
+        teacher_id=teacher_id,
+        student_ids=[student_id],
+        from_dt=from_dt,
+        horizon_days=horizon_days,
+        max_slots=max_slots,
+    )
+    return [
+        {"start": s.strftime("%Y-%m-%d %H:%M:%S"), "end": e.strftime("%Y-%m-%d %H:%M:%S")}
+        for s, e in slots
+    ]
+
+
+def tool_try_move_lesson(
+    engine,
+    lesson_class_id: int,
+    target_date_str: str,
+    target_slot_index: int,
+    horizon_days: int = 14,
+    max_depth: int = 2,
+) -> Dict[str, Any]:
+    """
+    工具4: 尝试把某个 class 的课挪开，腾出指定时间段。
+    使用递归 clear_slot_for_group。
+    返回 move_plan 或 None。
+    """
+    teacher_id, student_ids = get_class_participants(engine, lesson_class_id)
+    if teacher_id is None:
+        return {"success": False, "reason": f"class_id={lesson_class_id} 找不到 teacher_id"}
+
+    slot = ALLOWED_SLOTS[target_slot_index]
+    target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+    slot_start_dt, slot_end_dt = build_slot_dt(target_date, slot)
+
+    move_plan = clear_slot_for_group(
+        engine,
+        teacher_id=teacher_id,
+        student_ids=student_ids,
+        slot_start_dt=slot_start_dt,
+        slot_end_dt=slot_end_dt,
+        depth=0,
+        max_depth=max_depth,
+        horizon_days=horizon_days,
+    )
+
+    if move_plan is None:
+        return {"success": False, "reason": "在给定深度和时间范围内无法挪课"}
+
+    return {
+        "success": True,
+        "move_plan": move_plan,
+        "freed_slot": f"{slot_start_dt.strftime('%Y-%m-%d %H:%M:%S')} ~ {slot_end_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+    }
+
+
+def tool_find_student_movable_lessons(
+    engine,
+    student_id: int,
+    date_str: str,
+    slot_index: int,
+    horizon_days: int = 14,
+) -> List[Dict[str, Any]]:
+    """
+    工具5: 查看学生在指定时间段有什么课，并为每节课找到可选的替代时间。
+    用于"挪掉学生自己的课"策略。
+    """
+    slot = ALLOWED_SLOTS[slot_index]
+    target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+    slot_start_dt, slot_end_dt = build_slot_dt(target_date, slot)
+    start_unix = int(slot_start_dt.timestamp())
+    end_unix = int(slot_end_dt.timestamp())
+
+    # 找出学生在该时间段的课
+    with engine.connect() as conn:
+        sql = text("""
+            SELECT
+                l.id AS lesson_id,
+                IF(l.start_time=-1,'PERMANENT',FROM_UNIXTIME(l.start_time)) AS lesson_start,
+                IF(l.end_time=-1,'PERMANENT',FROM_UNIXTIME(l.end_time)) AS lesson_end,
+                s.id AS subject_id, s.class_id, s.teacher_id,
+                c.class_type AS class_name,
+                t.name AS topic_name, t.cn_name AS topic_cn_name
+            FROM lessons l
+            JOIN subjects s ON l.subject_id = s.id
+            JOIN classes c ON s.class_id = c.id
+            JOIN student_classes sc ON sc.class_id = s.class_id
+            LEFT JOIN topics t ON s.topic_id = t.id
+            WHERE ((l.start_time=-1 OR l.start_time <= :end_unix)
+               AND (l.end_time=-1 OR l.end_time >= :start_unix))
+              AND ((sc.start_time=-1 OR sc.start_time <= :end_unix)
+               AND (sc.end_time=-1 OR sc.end_time >= :start_unix))
+              AND sc.student_id = :sid
+            ORDER BY l.start_time
+        """)
+        rows = conn.execute(
+            sql, {"start_unix": start_unix, "end_unix": end_unix, "sid": student_id}
+        ).mappings().all()
+
+    results = []
+    seen = set()
+    for r in rows:
+        row = dict(r)
+        lid = row["lesson_id"]
+        if lid in seen:
+            continue
+        seen.add(lid)
+
+        class_id = row["class_id"]
+        les_teacher_id, les_student_ids = get_class_participants(engine, class_id)
+
+        # 找这门课的所有可选替代时间
+        alt_slots = find_future_slots_for_class_discrete_all(
+            engine,
+            teacher_id=les_teacher_id or 0,
+            student_ids=les_student_ids,
+            from_dt=slot_start_dt,
+            horizon_days=horizon_days,
+            max_slots=10,
+        )
+
+        row["topic"] = (row.get("topic_name") or "") + (row.get("topic_cn_name") or "")
+        row["alternative_times"] = [
+            {"start": s.strftime("%Y-%m-%d %H:%M:%S"), "end": e.strftime("%Y-%m-%d %H:%M:%S")}
+            for s, e in alt_slots
+        ]
+        results.append(row)
+
+    return results
+
+
+def tool_get_topic_ids_for_subject(engine, class_id: int) -> List[int]:
+    """
+    工具6: 根据 class_id 查出对应的 topic_id 列表。
+    """
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text("SELECT DISTINCT topic_id FROM subjects WHERE class_id = :cid AND topic_id IS NOT NULL"),
+            {"cid": class_id},
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+# =========================================================
+# 2b. RescheduleAgent — 多策略、自主探索的换课 Agent
+# =========================================================
+
+# Agent 可调用的工具注册表
+AGENT_TOOLS = [
+    {
+        "type": "function",
+        "name": "check_slot",
+        "description": "查看指定日期、时间段内老师和学生各有什么课。slot_index: 0=09:00-10:30, 1=10:30-12:00, 2=13:30-15:00, 3=15:00-16:30, 4=16:30-18:00, 5=18:00-19:30",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "日期 YYYY-MM-DD"},
+                "slot_index": {"type": "integer", "description": "时间段索引 0-5"},
+                "teacher_id": {"type": "integer", "description": "老师ID"},
+                "student_id": {"type": "integer", "description": "学生ID"},
+            },
+            "required": ["date", "slot_index", "teacher_id", "student_id"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "find_alt_teachers",
+        "description": "找到教同一科目(topic)的所有老师，并检查他们在指定时间段是否有空。需要先知道 topic_ids。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "topic_ids": {"type": "array", "items": {"type": "integer"}, "description": "科目ID列表"},
+                "student_id": {"type": "integer", "description": "学生ID"},
+                "date": {"type": "string", "description": "日期 YYYY-MM-DD"},
+                "slot_index": {"type": "integer", "description": "时间段索引 0-5"},
+            },
+            "required": ["topic_ids", "student_id", "date", "slot_index"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "find_alt_times",
+        "description": "为指定的老师和学生，在未来 N 天内找所有双方都空闲的 90 分钟时间段。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "teacher_id": {"type": "integer", "description": "老师ID"},
+                "student_id": {"type": "integer", "description": "学生ID"},
+                "from_date": {"type": "string", "description": "起始日期 YYYY-MM-DD"},
+                "horizon_days": {"type": "integer", "description": "搜索范围天数，默认14", "default": 14},
+            },
+            "required": ["teacher_id", "student_id", "from_date"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "try_move_lesson",
+        "description": "尝试把某个 class 在指定时间段的课挪走（递归挪课）。返回挪课方案或失败原因。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "class_id": {"type": "integer", "description": "要挪课的 class_id"},
+                "target_date": {"type": "string", "description": "目标日期 YYYY-MM-DD"},
+                "target_slot_index": {"type": "integer", "description": "目标时间段索引 0-5"},
+                "max_depth": {"type": "integer", "description": "递归深度，默认2", "default": 2},
+            },
+            "required": ["class_id", "target_date", "target_slot_index"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "find_student_movable",
+        "description": "查看学生在指定时间段有什么课，并为每节课找到可选的替代时间。用于考虑挪学生自己的课。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "student_id": {"type": "integer", "description": "学生ID"},
+                "date": {"type": "string", "description": "日期 YYYY-MM-DD"},
+                "slot_index": {"type": "integer", "description": "时间段索引 0-5"},
+            },
+            "required": ["student_id", "date", "slot_index"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_topic_ids",
+        "description": "根据 class_id 查出对应的科目 topic_id 列表。用于知道一门课属于什么科目，以便找替代老师。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "class_id": {"type": "integer", "description": "课程 class_id"},
+            },
+            "required": ["class_id"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "propose_plan",
+        "description": "提交一个完整的换课方案。可以提交多个方案（每次调用提交一个），系统会收集所有方案供管理员选择。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "plan_name": {"type": "string", "description": "方案名称，如 '方案A：换老师'"},
+                "disruption_level": {"type": "string", "enum": ["low", "medium", "high"], "description": "对现有课表的影响程度"},
+                "description": {"type": "string", "description": "方案说明（中文）"},
+                "steps": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "具体操作步骤列表",
+                },
+                "affected_people": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "受影响的老师/学生名单",
+                },
+            },
+            "required": ["plan_name", "disruption_level", "description", "steps"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "finish",
+        "description": "当你已经探索了足够多的策略并提交了多个方案后，调用此工具结束。给出最终总结。",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "最终总结（中文），说明你尝试了哪些策略，推荐哪个方案"},
+            },
+            "required": ["summary"],
+        },
+    },
+]
+
+
+class RescheduleAgent:
+    """
+    多策略自主换课 Agent。
+
+    核心思路（按干扰程度从低到高）：
+    策略1: 直接排课 — 如果时间和老师都有空，直接排
+    策略2: 换老师 — 同科目其他有空的老师
+    策略3: 换时间 — 同一老师，不同时间段
+    策略4: 挪别人的课 — 把占位的课挪到别的时间
+    策略5: 挪自己的课 — 把学生自己的课挪走再排新课
+
+    Agent 会自主尝试多种组合，并生成多个方案供管理员选择。
+    """
+
+    def __init__(self, engine, client: OpenAI, model: str = "gpt-4.1"):
+        self.engine = engine
+        self.client = client
+        self.model = model
+        self.proposals: List[Dict[str, Any]] = []
+
+    def _execute_tool(self, tool_name: str, args: Dict[str, Any]) -> Any:
+        """根据 tool_name 分发到对应的 Python 函数。"""
+        if tool_name == "check_slot":
+            return tool_check_slot(
+                self.engine,
+                teacher_id=args["teacher_id"],
+                student_id=args["student_id"],
+                date_str=args["date"],
+                slot_index=args["slot_index"],
+            )
+        elif tool_name == "find_alt_teachers":
+            return tool_find_alt_teachers(
+                self.engine,
+                topic_ids=args["topic_ids"],
+                student_id=args["student_id"],
+                date_str=args["date"],
+                slot_index=args["slot_index"],
+            )
+        elif tool_name == "find_alt_times":
+            return tool_find_alt_times_for_teacher(
+                self.engine,
+                teacher_id=args["teacher_id"],
+                student_id=args["student_id"],
+                from_date_str=args["from_date"],
+                horizon_days=args.get("horizon_days", 14),
+            )
+        elif tool_name == "try_move_lesson":
+            return tool_try_move_lesson(
+                self.engine,
+                lesson_class_id=args["class_id"],
+                target_date_str=args["target_date"],
+                target_slot_index=args["target_slot_index"],
+                max_depth=args.get("max_depth", 2),
+            )
+        elif tool_name == "find_student_movable":
+            return tool_find_student_movable_lessons(
+                self.engine,
+                student_id=args["student_id"],
+                date_str=args["date"],
+                slot_index=args["slot_index"],
+            )
+        elif tool_name == "get_topic_ids":
+            return tool_get_topic_ids_for_subject(self.engine, class_id=args["class_id"])
+        elif tool_name == "propose_plan":
+            proposal = {
+                "plan_name": args["plan_name"],
+                "disruption_level": args["disruption_level"],
+                "description": args["description"],
+                "steps": args.get("steps", []),
+                "affected_people": args.get("affected_people", []),
+            }
+            self.proposals.append(proposal)
+            return {"status": "ok", "proposal_index": len(self.proposals) - 1}
+        elif tool_name == "finish":
+            return {"status": "finished", "summary": args["summary"]}
+        else:
+            return {"error": f"未知工具: {tool_name}"}
+
+    def _build_system_prompt(
+        self,
+        student_name: str,
+        teacher_name: str,
+        student_id: int,
+        teacher_id: int,
+        requirement: str,
+        date_str: str,
+        slot_index: int,
+    ) -> str:
+        slot = ALLOWED_SLOTS[slot_index]
+        return f"""你是一个智能排课 Agent，负责帮助管理员完成换课/排课任务。
+
+## 任务背景
+- 学生: {student_name} (ID: {student_id})
+- 意向老师: {teacher_name} (ID: {teacher_id})
+- 意向时间: {date_str} {slot[0]}~{slot[1]} (slot_index={slot_index})
+- 排课需求: {requirement}
+
+## 时间段索引对照表
+0 = 09:00-10:30 | 1 = 10:30-12:00 | 2 = 13:30-15:00
+3 = 15:00-16:30 | 4 = 16:30-18:00 | 5 = 18:00-19:30
+只有工作日（周一到周五），没有周末。每节课 90 分钟。
+
+## 你的策略（按干扰程度从低到高尝试）
+
+**策略1: 直接排课**
+先用 check_slot 看看意向时间老师和学生是否都有空。如果都有空，直接 propose 一个方案。
+
+**策略2: 换老师**
+如果意向老师忙，先用 get_topic_ids 查出冲突课的科目，再用 find_alt_teachers 找同科目的其他空闲老师。如果找到了，propose 一个换老师方案。
+
+**策略3: 换时间**
+如果不想换老师，用 find_alt_times 为同一个老师找其他双方都空闲的时间。尽量找最近的、对学生影响最小的时间段。propose 一个换时间方案。
+
+**策略4: 挪别人的课**
+如果以上都不行，看看是谁占了那个时间段（用 check_slot 的返回数据），用 try_move_lesson 尝试把别人的课挪走。propose 一个挪别人课的方案。
+
+**策略5: 挪自己的课**
+如果学生自己在那个时间段也有课，用 find_student_movable 看看学生的课能不能挪到别的时间。propose 一个方案。
+
+## 工作规则
+1. 你必须**主动、多次**地使用工具去探索各种可能性，不要只试一种就放弃。
+2. 你应该尽量生成 **2-4 个不同方案**（propose_plan），让管理员有选择余地。
+3. 每个方案要标明 disruption_level (low/medium/high)。
+4. 最终调用 finish 给出总结和推荐。
+5. 如果所有策略都试过仍然无解，也要在 finish 中说明原因。
+6. 不要在一步内就直接 finish，要先充分探索。
+7. 在给出 propose_plan 中，所有时间要写成具体的 "YYYY-MM-DD HH:MM ~ HH:MM" 格式。
+8. 用中文回复。"""
+
+    def run(
+        self,
+        student_name: str,
+        teacher_name: str,
+        student_id: int,
+        teacher_id: int,
+        requirement: str,
+        date_str: str,
+        slot_index: int,
+        max_steps: int = 12,
+    ) -> Dict[str, Any]:
+        """
+        运行 Agent，返回:
+        {
+            "proposals": [...],   # 所有收集到的方案
+            "summary": "...",     # 最终总结
+            "steps_used": int,    # 使用了多少步
+        }
+        """
+        self.proposals = []
+
+        system_prompt = self._build_system_prompt(
+            student_name, teacher_name, student_id, teacher_id,
+            requirement, date_str, slot_index,
+        )
+
+        # 构建 messages（OpenAI Responses API 用 input 列表）
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": "请开始排课分析。先检查意向时间的冲突情况，然后按策略优先级逐步尝试。"},
+        ]
+
+        for step in range(max_steps):
+            print(f"  [Agent 第 {step+1} 步]")
+
+            resp = self.client.responses.create(
+                model=self.model,
+                input=messages,
+                tools=AGENT_TOOLS,
+            )
+
+            # 处理 response
+            assistant_msg = {"role": "assistant", "content": []}
+            tool_calls_to_process = []
+
+            for item in resp.output:
+                if hasattr(item, "type"):
+                    if item.type == "function_call":
+                        tool_calls_to_process.append(item)
+                        assistant_msg["content"].append({
+                            "type": "function_call",
+                            "id": item.id,
+                            "call_id": item.call_id,
+                            "name": item.name,
+                            "arguments": item.arguments,
+                        })
+                    elif item.type == "message" or hasattr(item, "content"):
+                        # 文本回复
+                        if hasattr(item, "content"):
+                            for c in item.content:
+                                if hasattr(c, "text"):
+                                    assistant_msg["content"].append({
+                                        "type": "text",
+                                        "text": c.text,
+                                    })
+                                    print(f"    Agent: {c.text[:200]}...")
+
+            messages.append(assistant_msg)
+
+            if not tool_calls_to_process:
+                # 没有工具调用，可能是纯文本回复或结束
+                break
+
+            # 执行所有工具调用
+            finished = False
+            for tc in tool_calls_to_process:
+                func_name = tc.name
+                try:
+                    func_args = json.loads(tc.arguments)
+                except json.JSONDecodeError:
+                    func_args = {}
+
+                print(f"    -> 调用 {func_name}({json.dumps(func_args, ensure_ascii=False)[:100]})")
+                tool_result = self._execute_tool(func_name, func_args)
+
+                # 序列化工具结果
+                result_str = json.dumps(tool_result, ensure_ascii=False, default=str)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.call_id,
+                    "content": result_str,
+                })
+
+                if func_name == "finish":
+                    finished = True
+
+            if finished:
+                return {
+                    "proposals": self.proposals,
+                    "summary": tool_result.get("summary", ""),
+                    "steps_used": step + 1,
+                }
+
+        # 超过 max_steps 还没 finish，强制总结
+        summary = self._force_summary(messages)
+        return {
+            "proposals": self.proposals,
+            "summary": summary,
+            "steps_used": max_steps,
+        }
+
+    def _force_summary(self, messages: List) -> str:
+        """超步数后强制让 LLM 给出最终总结。"""
+        messages.append({
+            "role": "user",
+            "content": "你已经用完了所有步数。请立即调用 finish 工具，给出最终总结，包括你已经找到的所有方案和推荐。",
+        })
+        resp = self.client.responses.create(
+            model=self.model,
+            input=messages,
+            tools=AGENT_TOOLS,
+        )
+        for item in resp.output:
+            if hasattr(item, "type") and item.type == "function_call" and item.name == "finish":
+                try:
+                    args = json.loads(item.arguments)
+                    return args.get("summary", "Agent 未能给出总结。")
+                except Exception:
+                    pass
+            if hasattr(item, "content"):
+                for c in item.content:
+                    if hasattr(c, "text"):
+                        return c.text
+        return "Agent 超步数且未能生成总结。"
+
+
+# =========================================================
+# 2c. Legacy SchedulingAgent (保留兼容)
+# =========================================================
 
 class SchedulingAgent:
     """
@@ -1400,27 +2156,169 @@ class SchedulingAgent:
 # =========================
 # 3. 命令行入口
 # =========================
+
+SLOT_DISPLAY = [
+    "0: 09:00-10:30",
+    "1: 10:30-12:00",
+    "2: 13:30-15:00",
+    "3: 15:00-16:30",
+    "4: 16:30-18:00",
+    "5: 18:00-19:30",
+]
+
+
+def print_schedule_result(result: Dict[str, Any]):
+    """美观打印 query_lesson_schedule 的返回结果。"""
+    print(f"\n  时间段: {result['slot_start']} ~ {result['slot_end']}")
+
+    print(f"\n  【学生课表】 {'有课' if result['student_has_class'] else '无课'}")
+    for les in result["student_lessons"]:
+        print(f"    - {les.get('topic', '未知课程')} | "
+              f"老师: {les.get('teacher_name', '未知')} | "
+              f"class_id: {les.get('class_id')}")
+
+    print(f"\n  【老师课表】 {'有课' if result['teacher_has_class'] else '无课'}")
+    for les in result["teacher_lessons"]:
+        students = ", ".join(
+            s["student_name"] or str(s["student_id"])
+            for s in les.get("students_in_class", [])
+        )
+        print(f"    - {les.get('topic', '未知课程')} | "
+              f"class: {les.get('class_name', '')} | "
+              f"学生: [{students}]")
+
+
+def print_proposals(proposals: List[Dict[str, Any]]):
+    """美观打印 Agent 生成的所有方案。"""
+    if not proposals:
+        print("\n  Agent 未能生成任何方案。")
+        return
+
+    # 按干扰程度排序
+    level_order = {"low": 0, "medium": 1, "high": 2}
+    sorted_proposals = sorted(
+        proposals,
+        key=lambda p: level_order.get(p.get("disruption_level", "high"), 3),
+    )
+
+    for i, p in enumerate(sorted_proposals, 1):
+        level = p.get("disruption_level", "?")
+        level_emoji = {"low": "[低影响]", "medium": "[中影响]", "high": "[高影响]"}.get(level, f"[{level}]")
+
+        print(f"\n  ---- {p['plan_name']} {level_emoji} ----")
+        print(f"  说明: {p['description']}")
+        if p.get("steps"):
+            print("  步骤:")
+            for j, step in enumerate(p["steps"], 1):
+                print(f"    {j}. {step}")
+        if p.get("affected_people"):
+            print(f"  受影响人员: {', '.join(p['affected_people'])}")
+
+
 def main():
     client = OpenAI(api_key="")
     llm_model = "gpt-4.1"
 
     # ===== 一次性输入 =====
+    student_name = input("请输入学生名字: ").strip()
+    teacher_name = input("请输入意向老师名字: ").strip()
+    date_str = input("请输入日期 (YYYY-MM-DD): ").strip()
+
+    print("\n可选时间段:")
+    for s in SLOT_DISPLAY:
+        print(f"  {s}")
+    slot_index = int(input("请选择时间段编号 (0-5): ").strip())
+
+    requirement = input("排课需求（例如：加数学课 / 希望换老师 / 换时间等）: ").strip()
+
+    # ===== 第一步：解析 ID =====
+    teacher_id, student_id = get_ids(engine, teacher_name, student_name)
+    if teacher_id is None:
+        print(f"\n错误：找不到老师 '{teacher_name}'")
+        return
+    if student_id is None:
+        print(f"\n错误：找不到学生 '{student_name}'")
+        return
+
+    print(f"\n已识别: 学生 {student_name}(ID:{student_id}), 老师 {teacher_name}(ID:{teacher_id})")
+
+    # ===== 第二步：查询当前时间段课表 =====
+    print("\n================ 当前课表查询 ================")
+    schedule = query_lesson_schedule(engine, date_str, slot_index, teacher_id, student_id)
+
+    if "error" in schedule:
+        print(f"查询错误: {schedule['error']}")
+        return
+
+    print_schedule_result(schedule)
+
+    # ===== 第三步：判断是否有冲突 =====
+    student_busy = schedule["student_has_class"]
+    teacher_busy = schedule["teacher_has_class"]
+
+    if not student_busy and not teacher_busy:
+        print("\n================ 排课建议 ================")
+        print(f"学生和老师在该时间段均无课，可以直接安排新课。")
+        print(f"  时间: {schedule['slot_start']} ~ {schedule['slot_end']}")
+        print(f"  老师: {teacher_name}")
+        print(f"  学生: {student_name}")
+        return
+
+    # 有冲突，显示冲突概况
+    print("\n================ 检测到冲突 ================")
+    if teacher_busy and student_busy:
+        print("  状态: 老师和学生都有课")
+    elif teacher_busy:
+        print("  状态: 老师有课，学生空闲")
+    else:
+        print("  状态: 学生有课，老师空闲")
+
+    # ===== 第四步：启动 RescheduleAgent =====
+    print("\n================ 启动智能换课 Agent ================")
+    print("Agent 将按以下策略自动探索换课方案:")
+    print("  1. 换老师 (同科目其他老师)")
+    print("  2. 换时间 (同老师不同时间)")
+    print("  3. 挪别人的课 (腾出时间段)")
+    print("  4. 挪自己的课 (为新课让路)")
+    print()
+
+    agent = RescheduleAgent(engine, client, model=llm_model)
+    result = agent.run(
+        student_name=student_name,
+        teacher_name=teacher_name,
+        student_id=student_id,
+        teacher_id=teacher_id,
+        requirement=requirement,
+        date_str=date_str,
+        slot_index=slot_index,
+        max_steps=12,
+    )
+
+    # ===== 第五步：输出结果 =====
+    print("\n================ Agent 方案汇总 ================")
+    print(f"  探索步数: {result['steps_used']}")
+    print(f"  生成方案数: {len(result['proposals'])}")
+
+    print_proposals(result["proposals"])
+
+    print(f"\n================ Agent 总结 ================")
+    print(f"  {result['summary']}")
+
+    print("\n请管理员从以上方案中选择最终排课方式。\n")
+
+
+# ===== 旧版入口（保留兼容） =====
+def main_legacy():
+    """旧版 main()，使用 intent_start/intent_end 输入方式和 SchedulingAgent。"""
+    client = OpenAI(api_key="")
+    llm_model = "gpt-4.1"
+
     student_name = input("请输入需要换课/加课/删课的学生名字：").strip()
-    print(f"你输入的学生是：{student_name}\n")
-
     teacher_name = input("请输入意向老师名字：").strip()
-    print(f"你输入的老师是：{teacher_name}\n")
-
     intent_start = input("请输入意向开始时间，格式20xx-xx-xx xx:xx:00：").strip()
-    print(f"你输入的意向开始时间是：{intent_start}\n")
-
     intent_end = input("请输入意向结束时间，格式20xx-xx-xx xx:xx:00：").strip()
-    print(f"你输入的意向结束时间是：{intent_end}\n")
+    requirement = input("申请要求：").strip()
 
-    requirement = input("申请要求（例如：加哪门课/希望时间段/是否可以换老师等）：").strip()
-    print(f"你输入的申请要求是：{requirement}\n")
-
-    # ===== 第一步：当前老师是否可以直接上 =====
     base = direct_check_and_plan(
         engine,
         student_name=student_name,
@@ -1433,83 +2331,29 @@ def main():
     check_result = base["check_result"]
 
     if status == "ok":
-        print("\n================ 排课建议 ================\n")
-        print(f"学生 {student_name} 与老师 {teacher_name} 在 {intent_start} ~ {intent_end} 均无课程冲突，可以直接在该时间安排新课。")
+        print(f"\n学生和老师在 {intent_start} ~ {intent_end} 均无课程冲突，可以直接排课。")
         return
 
-    # 是否在申请中明确写了“可以换老师”
-    can_change_teacher = ("换老师" in requirement) or ("可以换老师" in requirement)
-
-    # ===== 第二步：只要老师忙，就【总是】跑一次“换老师方案”，供管理员参考 =====
-    change_res = {
-        "success": False,
-        "candidates": [],
-        "reason": "老师在该时间段并非忙碌。",
-    }
+    # 换老师
     if "teacher_busy" in status:
         change_res = change_teacher_strategy(
-            engine,
-            client,
-            llm_model,
+            engine, client, llm_model,
             student_name=student_name,
             requirement=requirement,
             intent_start=intent_start,
             intent_end=intent_end,
         )
+        print("========== 方案一：换老师 ==========")
+        if change_res["success"]:
+            for item in change_res["candidates"]:
+                print(f"  - {item['teacher_name']} (ID {item['teacher_id']})")
+        else:
+            print("  没有可用的替代老师")
 
-    print("========== 方案一：换老师 ==========")
-    if not can_change_teacher:
-        print("（提示：学生申请中未明确写“可以换老师”，以下方案仅供管理员评估参考。）")
-
-    if change_res["success"]:
-        # 解析意向时间，只考虑同一天的 slot
-        intent_start_dt = datetime.fromisoformat(intent_start)
-        intent_end_dt = datetime.fromisoformat(intent_end)
-        target_date = intent_start_dt.date()
-
-        for item in change_res["candidates"]:
-            tname = item["teacher_name"]
-            tid = item["teacher_id"]
-
-            available_slots = []
-
-            # 枚举当天所有固定 timeslot
-            for slot in ALLOWED_SLOTS:
-                slot_start_dt, slot_end_dt = build_slot_dt(target_date, slot)
-
-                # 只考虑落在意向时间范围内的 slot
-                if not (slot_start_dt >= intent_start_dt and slot_end_dt <= intent_end_dt):
-                    continue
-
-                # 用已有的 check_schedule 检查该老师 + 学生在这个 slot 有没有课
-                r = check_schedule(
-                    engine,
-                    start_time_str=slot_start_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                    end_time_str=slot_end_dt.strftime("%Y-%m-%d %H:%M:%S"),
-                    teacher_name=tname,
-                    student_name=student_name,
-                )
-                teacher_busy = len(r["teacher_struct"]) > 0
-                student_busy = len(r["student_struct"]) > 0
-
-                if (not teacher_busy) and (not student_busy):
-                    # 这个 90min slot 完全空闲
-                    available_slots.append(f"{slot_start_dt.strftime('%H:%M')}–{slot_end_dt.strftime('%H:%M')}")
-
-            if available_slots:
-                slots_str = "，".join(available_slots)
-                print(f"- 老师：{tname}（ID {tid}）可上课时间段：{slots_str}")
-            else:
-                print(f"- 老师：{tname}（ID {tid}）在当前意向时间段内没有符合固定 timeslot 的空档")
-    else:
-        print("没有可用老师（或老师并非处于忙碌状态）")
-
-    # ===== 第三步：只要老师忙，就尝试“挪掉当前老师的课再补上” =====
+    # 挪课
     if "teacher_busy" in status:
         move_res = move_existing_lessons_strategy(
-            engine,
-            client,
-            llm_model,
+            engine, client, llm_model,
             student_name=student_name,
             teacher_name=teacher_name,
             intent_start=intent_start,
@@ -1519,56 +2363,12 @@ def main():
         print("\n========== 方案二：挪课 ==========")
         if move_res["success"]:
             for item in move_res["candidates"]:
-                print(f"- 目标 Slot：{item['slot']}")
-                print("  需要挪动的课程：")
-
+                print(f"  目标: {item['slot']}")
                 for les in item["move_plan"]:
                     ori = les["original_lesson"]
-                    org_topic = ori.get("topic", "（无课程名）")
-                    org_id = ori.get("lesson_id", "未知ID")
-                    org_start = ori.get("lesson_start")
-                    org_end = ori.get("lesson_end")
+                    print(f"    挪课: {ori.get('topic', '?')} -> {len(les['options'])} 个可选时间")
 
-                    print(f"    • 课程：{org_topic}（课时ID：{org_id}）")
-                    print(f"      原时间：{org_start} ~ {org_end}")
-                    print(f"      可选新时间：")
-
-                    for opt in les["options"]:
-                        new_start = opt["new_start"]
-                        new_end = opt["new_end"]
-                        print(f"        - {new_start} ~ {new_end}")
-        else:
-        #     print("无法通过挪课解决冲突")
-        # # 在老师繁忙、且你想尝试更聪明的连续换班时，可以启用 Agent：
-        # use_agent = "agent" in requirement.lower() or "连续" in requirement
-        #
-        # if use_agent:
-            print("\n===== 启动 SchedulingAgent（多轮智能排课）=====")
-
-            intent_date = datetime.fromisoformat(intent_start).date()
-            # 这里简单设置 week_start/week_end 为“包含意向日期的这一周”
-            week_monday = intent_date - timedelta(days=intent_date.weekday())  # 周一
-            week_sunday = week_monday + timedelta(days=6)
-
-            week_start = week_monday.strftime("%Y-%m-%d 00:00:00")
-            week_end = week_sunday.strftime("%Y-%m-%d 23:59:59")
-
-            agent = SchedulingAgent(engine, client, model=llm_model)
-            final_text = agent.run(
-                student_name=student_name,
-                teacher_name=teacher_name,
-                requirement=requirement,
-                intent_start=intent_start,
-                intent_end=intent_end,
-                week_start=week_start,
-                week_end=week_end,
-                max_steps=6,
-            )
-
-            print("\n===== Agent 给出的最终建议 =====\n")
-            print(final_text)
-
-        print("\n请管理员从以上方案中选择最终排课方式。")
+    print("\n请管理员从以上方案中选择。")
 
 
 if __name__ == "__main__":
