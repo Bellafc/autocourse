@@ -1,0 +1,119 @@
+id,name,is_english,cn_name
+317,AQA IG English Literature,0,IG文学
+318,Public Speaking,0,公众演讲
+319,English,0,英语
+320,CIE EFL-Reading,0,英语第一语言阅读
+321,CIE EFL-Writing,0,英语第一语言写作
+322,ESL-Vocabulary,0,英语词汇
+323,ESL-English,0,英语综合英语
+324,ESL-Grammar,0,英语语法
+325,CIE IG French,0,IG法语
+326,French,0,法语
+327,CIE IG French-L&S,0,IG法语听口
+328,CIE IG French-R&W,0,IG法语阅写
+329,CIE French-L&S,0,法语听口
+330,CIE French-R&W,0,法语阅写
+331,CIE IG Maths,0,IG数学
+332,CIE IG Additional Maths,0,IG高数
+333,Edexcel Maths-D1,0,数学D1
+334,Edexcel Maths-F1,0,数学F1
+335,Edexcel Maths-F2,0,数学F2
+336,Edexcel Maths-F3,0,数学F3
+337,Edexcel Maths-M1,0,数学M1
+338,Edexcel Maths-M2,0,数学M2
+339,Edexcel Maths-M3,0,数学M3
+340,Edexcel Maths-P1,0,数学P1
+341,Edexcel Maths-P2,0,数学P2
+342,Edexcel Maths-P3,0,数学P3
+343,Edexcel Maths-P4,0,数学P4
+344,Edexcel Maths-S1,0,数学S1
+345,Edexcel Maths-S2,0,数学S2
+346,Edexcel Maths-S3,0,数学S3
+347,CIE IG Computer Science,0,IG计算机
+348,CIE Computer Science,0,计算机
+349,CIE IG ICT,0,IG信息技术
+350,CIE IG Biology,0,IG生物
+351,CIE Biology-AS,0,生物AS
+352,CIE Biology-A2,0,生物A2
+353,CIE IG Chemistry,0,IG化学
+354,CIE Chemistry-AS,0,化学AS
+355,CIE Chemistry-A2,0,化学A2
+356,CIE IG Physics,0,IG物理
+357,CIE Physics-AS,0,物理AS
+358,CIE Physics-A2,0,物理A2
+359,Experiment,0,实验
+360,Edexcel IG ACCT-U1,0,IG会计U1
+361,Edexcel IG ACCT-U2,0,IG会计U2
+362,Edexcel ACCT-U1,0,会计U1
+363,Edexcel ACCT-U2,0,会计U2
+364,CIE IG Business,0,IG商科
+365,CIE Business-AS,0,商科AS
+366,CIE Business-A2,0,商科A2
+367,Edexcel IG Econ-U1,0,IG经济U1
+368,Edexcel IG Econ-U2,0,IG经济U2
+369,CIE IG Economics,0,IG经济
+370,Edexcel Economics-U1,0,经济U1
+371,Edexcel Economics-U2,0,经济U2
+372,Edexcel Economics-U3,0,经济U3
+373,Edexcel Economics-U4,0,经济U4
+374,Business Case Study,0,商业案例分析
+375,CIE Psychology-AS,0,心理AS
+376,CIE Psychology-A2,0,心理A2
+377,CIE IG History,0,IG历史
+378,CIE History-AS,0,历史AS
+379,CIE History-A2,0,历史A2
+380,CIE IG Chinese,0,IG中文
+381,IG Global Perspectives,0,IG全球视野
+382,Psychology of films,0,影视心理学
+383,Micro History,0,微观历史学
+384,Basketball,0,篮球
+385,Table Tennis,0,乒乓球
+386,Football,0,足球
+387,Fitness,0,健身
+388,Badminton,0,羽毛球
+389,Climbing ,0,攀岩
+390,P.E.,0,体育
+391,Art,0,艺术
+392,Activity,0,活动
+393,IELTS-Reading,0,雅思阅读
+394,IELTS-Writing,0,雅思写作
+395,IELTS-Speaking,0,雅思口语
+396,IELTS-Listening,0,雅思听力
+397,CIE IG ACCT,0,CIE IG会计
+398,End of week,0,放学课
+400,CIE IG Geography,0,IG地理
+401,CIE EFL-Speaking ,0,EFL口语
+402,AMC,0,AMC课程
+403,IPC,0,IPC课程
+404,BPHO,0,BPHO课程
+405,UKCHO,0,UKCHO课程
+406,BBO,0,BBO课程
+407,NEC,0,NEC课程
+408,IELTS,0,雅思
+409,Edexcel IG ACCT,0,EDX IG会计
+410,Edexcel ACCT AS,0,会计AS
+411,Edexcel IAL History-U1,0,历史U1
+412,Frisbee,0,飞盘
+413,AQA ESL R&W,0,AQA阅读&写作
+414,AQA ESL L&S,0,AQA听力&口语
+415,ICT,0,信息通讯技术
+416,Edexcel IAL History-U2,0,历史U2
+417,CIE French-AS,0,AS法语
+418,Geography,0,地理兴趣班
+419,Roller Ski,0,轮滑
+420,Yoga,0,瑜伽
+421,CIE EFL-Speaking,0,英语第一语言口语
+422,CIE Busienss-AS,0,商业AS
+423,Edexcel IG Economics-U1,0,IG经济U1
+424,Edexcel IG Economics-U2,0,IG经济U2
+425,CIE Chinese Language & Literature,0,CIE中文文学
+426,Edexcel IG Physics,0,EDX IG 物理
+427,AQA ESL,0,AQA ESL
+428,Edexcel Maths-P12,0,数学P1&P2
+429,Edexcel Chemistry,0,EDX化学
+430,Edexcel Physics,0,EDX物理
+431,CIE EFL,0,英语第一语言
+432,Edexcel IAL History-U3,0,历史U3
+433,CIE Geography-AS,0,地理AS
+434,Marine Science,0,海洋科学
+435,Edexcel IG Economics,0,EDX IG经济
